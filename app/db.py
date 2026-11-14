@@ -52,6 +52,29 @@ CREATE TABLE IF NOT EXISTS observations (
     eff_deleted      INTEGER NOT NULL DEFAULT 0,
     version          INTEGER NOT NULL           -- 状态版本，每次变化 +1
 );
+
+-- 交付切片：一次发布时冻结的全部内容；写入后不再随观测修订变化。
+CREATE TABLE IF NOT EXISTS deliveries (
+    delivery_id     TEXT PRIMARY KEY,           -- 交付号（全局唯一）
+    observation_ids TEXT NOT NULL,              -- JSON 数组：提交时的观测号及顺序
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE TABLE IF NOT EXISTS delivery_items (
+    delivery_id        TEXT NOT NULL,
+    position           INTEGER NOT NULL,        -- 保持提交时的观测号顺序
+    observation_id     TEXT NOT NULL,
+    revision_id        TEXT NOT NULL,           -- 固化时的有效修订号（当前分支）
+    tips               TEXT NOT NULL,           -- JSON 数组：固化时的当前分支
+    species            TEXT,
+    individual_count   INTEGER,
+    is_delete          INTEGER NOT NULL DEFAULT 0,
+    obs_version        INTEGER NOT NULL,        -- 固化时观测状态版本
+    PRIMARY KEY (delivery_id, position),
+    UNIQUE (delivery_id, observation_id),
+    FOREIGN KEY (delivery_id) REFERENCES deliveries(delivery_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_delivery_items_obs ON delivery_items(observation_id);
 """
 
 
@@ -108,8 +131,19 @@ def write_tx():
 
 @contextmanager
 def read_tx():
+    """只读事务：显式 BEGIN 固定一个一致性快照。
+
+    WAL 模式下读快照不阻塞其他进程写入；同一事务内的多次查询看到同一个
+    已提交状态（交付切片据此从同一状态读取全部所选观测）。
+    """
     conn = connect()
     try:
-        yield conn
+        conn.execute("BEGIN")
+        try:
+            yield conn
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
     finally:
         conn.close()

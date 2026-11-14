@@ -31,6 +31,66 @@
   （含父修订后到但观测号不符的反向情形）。
 - **原子性**：一个包可含多条修订、多个观测，任一非法则整体回滚。
 
+## 交付切片（按调查批次取数）
+
+生态分析员按调查批次领取可复现的观测数据。一次交付 = 交付号 + 至多 **100 个
+不重复观测号**；发布后内容冻结，后续修订不会改动已交付切片。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `POST` | `/deliveries` | 发布交付切片：`{"delivery_id": "...", "observation_ids": [...]}` |
+| `GET` | `/deliveries` | 列出全部已固化切片 |
+| `GET` | `/deliveries/{delivery_id}` | 查询单个已固化切片 |
+
+**发布语义**
+
+- 组装阶段在一个只读快照（`BEGIN`）里从**同一已提交状态**读取全部所选观测的
+  当前分支与有效值；期间其他进程照常汇交，不会混入本次组装。
+- 任一观测**不存在 / 待补齐 / 冲突**：返回 **422**，列出全部阻断项
+  （`reason`、当前分支、未齐祖先），**不保存切片**；补传/裁决后同号重试即可。
+- 全部可用才在 **一个 `BEGIN IMMEDIATE` 写事务**里一次性固化观测号、修订号、
+  物种、数量、删除标记（201）。
+- 组装之后、固化之前若所选观测被其他进程改动，指纹不符 → **409**
+  （`changed_observation_ids`），整体回滚，**不发布混合切片**。
+- **同号重试**（观测号集合相同，顺序无关）→ **200**，原样返回首次固化的切片
+  （`existing: true`，`created_at` 与内容不变）。
+- 同号但**观测号集合不同** → **409**，不覆盖已交付内容。
+- 并发提交同号：写事务跨进程串行化，先到者固化，后到者返回同一份结果，只留一份。
+
+### 发布示例
+
+```bash
+curl -X POST http://localhost:8001/deliveries -H 'Content-Type: application/json' -d '{
+  "delivery_id": "BATCH-2026-W01",
+  "observation_ids": ["OBS-1", "OBS-2"]
+}'
+```
+
+```json
+{
+  "delivery_id": "BATCH-2026-W01",
+  "observation_ids": ["OBS-1", "OBS-2"],
+  "created_at": "2026-11-14T13:15:55.115Z",
+  "existing": false,
+  "items": [
+    {"observation_id": "OBS-1", "revision_id": "r2", "tips": ["r2"],
+     "species": "Cervus elaphus", "count": 3, "deleted": false, "version": 2}
+  ]
+}
+```
+
+阻断时的 422：
+
+```json
+{"detail": {"message": "交付切片存在阻断项", "blockers": [
+  {"observation_id": "OBS-9", "reason": "missing", "message": "观测不存在"},
+  {"observation_id": "OBS-3", "reason": "pending", "message": "观测待补齐",
+   "status": "pending", "tips": ["r9"], "missing_ancestors": ["r8"]},
+  {"observation_id": "OBS-4", "reason": "conflict", "message": "观测存在冲突",
+   "status": "conflict", "tips": ["r5", "r6"]}
+]}}
+```
+
 ## 运行（Docker Compose）
 
 ```bash
@@ -52,6 +112,9 @@ docker compose up --build
 | `GET` | `/observations/{id}/revisions` | 观测的全部修订（DAG 节点） |
 | `GET` | `/conflicts` | 查冲突：全部多分支观测及其当前分支 |
 | `POST` | `/observations/{id}/resolutions` | 人工裁决（201；幂等重放 200；分支已变 409） |
+| `POST` | `/deliveries` | 发布交付切片（201；同号重试 200；阻断 422；集合不同/固化前变化 409） |
+| `GET` | `/deliveries` | 列出全部已固化切片 |
+| `GET` | `/deliveries/{delivery_id}` | 查询单个已固化切片 |
 | `GET` | `/health` | 健康检查 |
 
 ### 上报示例
@@ -85,6 +148,7 @@ curl -X POST http://localhost:8001/observations/OBS-1/resolutions \
 bash samples/01_out_of_order.sh              # 乱序：子先父后 → 待补齐 → 自动重算
 bash samples/02_edit_delete_conflict.sh      # 改删并发 → 冲突 → 裁决 → 迟到分支 → 409
 bash samples/03_idempotency_and_rejection.sh # 幂等重传；异内容/循环/跨观测整包拒绝
+bash samples/04_delivery_slices.sh           # 交付切片：阻断项 → 补传重试 → 幂等重放 → 集合不同 409 → 固化内容不变
 ```
 
 ## 一致性与并发设计
@@ -94,12 +158,15 @@ bash samples/03_idempotency_and_rejection.sh # 幂等重传；异内容/循环/�
 - SQLite **WAL** 模式：读写互不阻塞；写事务一律 `BEGIN IMMEDIATE`，
   跨进程串行化写入，`busy_timeout` + 重试消除瞬时锁冲突。
 - 库文件在命名卷上，进程重启、容器重建均保留。
+- 交付切片：组装用只读事务（`BEGIN`）固定一个已提交快照，从同一状态读取全部
+  所选观测；固化用 `BEGIN IMMEDIATE` 写事务，先校验组装后是否有变化再整体写入。
+  两个进程共用该库，因此任一端发布、两端查询到同一份切片。
 
 ## 本地开发与测试
 
 ```bash
 pip install -r requirements.txt
 pip install pytest httpx
-python -m pytest tests/ -q          # 18 个行为测试
+python -m pytest tests/ -q          # 32 个行为测试（含交付切片）
 DB_PATH=./data/dev.db uvicorn app.main:app --port 8000
 ```

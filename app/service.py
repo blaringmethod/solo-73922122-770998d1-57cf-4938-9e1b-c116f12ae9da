@@ -9,6 +9,12 @@
 
 人工裁决：以裁决时所见全部分支（tips）为父新建修订；提交时分支已变则 409；
 裁决之后迟到的并发分支会重新形成冲突，不会被裁决吞没。
+
+交付切片：按交付号从同一已提交状态读取一批观测的当前分支与有效值；任一观测
+不存在/待补齐/冲突则列出阻断项、不保存切片；全部可用才在单个写事务内一次性
+固化（观测号、修订号、物种、数量、删除标记），全部 SELECT 之后再写，保证
+其他进程的汇交不会让切片混入不同时点的数据；所选观测在固化前变化则 409。
+同号重试返回原切片；观测号集合不同则 409；并发提交同号只留一份结果。
 """
 from __future__ import annotations
 
@@ -34,6 +40,23 @@ class BranchesChanged(Exception):
         self.observation_id = observation_id
         self.current_tips = current_tips
         self.status = status
+
+
+class DeliveryBlocked(Exception):
+    """交付切片存在阻断项：不保存切片，修正后可重试。"""
+
+    def __init__(self, blockers: list[dict]):
+        super().__init__("交付切片存在阻断项")
+        self.blockers = blockers
+
+
+class DeliveryConflict(Exception):
+    """交付号已存在但观测号集合不同，或固化前所选观测发生变化（409）。"""
+
+    def __init__(self, message: str, **extra):
+        super().__init__(message)
+        self.message = message
+        self.extra = extra
 
 
 @dataclass
@@ -337,6 +360,223 @@ def _validate_new_revisions(
                 raise PackageRejected(
                     f"修订 {rid} 与既有子修订 {row['revision_id']} 跨观测引用"
                 )
+
+
+# ---------------------------------------------------------------- 交付切片
+
+MAX_DELIVERY_ITEMS = 100
+
+
+def _fingerprint(conn: sqlite3.Connection, observation_id: str) -> Optional[tuple]:
+    """观测当前状态的指纹：用于判断组装后、固化前是否被并发汇交改动。
+
+    状态版本在每次状态变化时 +1；修订总数与状态版本合在一起，可识别任何
+    新修订入库（修订不可变，有效值只可能随修订集合变化）。
+    """
+    row = conn.execute(
+        "SELECT version, status, tips FROM observations WHERE observation_id = ?",
+        (observation_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    count = conn.execute(
+        "SELECT COUNT(*) FROM revisions WHERE observation_id = ?", (observation_id,)
+    ).fetchone()[0]
+    return (row["version"], row["status"], row["tips"], count)
+
+
+def _blocker_from_state(state: Optional[dict], observation_id: str) -> Optional[dict]:
+    """按观测状态给出阻断项；可用（valid）时返回 None。"""
+    if state is None:
+        return {
+            "observation_id": observation_id,
+            "reason": "missing",
+            "status": "missing",
+            "message": "观测不存在",
+        }
+    if state["status"] == "valid":
+        return None
+    return {
+        "observation_id": observation_id,
+        "reason": state["status"],  # pending | conflict
+        "status": state["status"],
+        "message": "观测待补齐" if state["status"] == "pending" else "观测存在冲突",
+        "tips": state["tips"],
+        "missing_ancestors": state["missing_ancestors"],
+    }
+
+
+def _blocker(conn: sqlite3.Connection, observation_id: str) -> Optional[dict]:
+    return _blocker_from_state(get_observation(conn, observation_id), observation_id)
+
+
+def assemble_delivery(
+    conn: sqlite3.Connection, delivery_id: str, observation_ids: list[str]
+) -> dict:
+    """组装阶段（只读快照）：从同一已提交状态读取全部所选观测。
+
+    - 同号且观测号集合一致：直接返回原切片（不重新组装）；
+    - 同号但集合不同：409；
+    - 任一观测不存在/待补齐/冲突：列出全部阻断项，不保存切片；
+    - 全部可用：返回候选切片与各观测指纹，供固化阶段校验是否被并发改动。
+    """
+    existing = replay_existing_delivery(conn, delivery_id, observation_ids)
+    if existing is not None:
+        return existing
+
+    states: list[dict] = []
+    blockers: list[dict] = []
+    fingerprints: dict[str, tuple] = {}
+    for obs_id in observation_ids:
+        state = get_observation(conn, obs_id)
+        blocker = _blocker_from_state(state, obs_id)
+        if blocker is not None:
+            blockers.append(blocker)
+            continue
+        assert state is not None
+        states.append(state)
+        fingerprints[obs_id] = _fingerprint(conn, obs_id)  # type: ignore[assignment]
+    if blockers:
+        raise DeliveryBlocked(blockers)
+
+    return {
+        "delivery_id": delivery_id,
+        "observation_ids": list(observation_ids),
+        "items": [
+            {
+                "observation_id": s["observation_id"],
+                "revision_id": s["effective"]["revision_id"],
+                "tips": s["tips"],
+                "species": s["effective"]["species"],
+                "count": s["effective"]["count"],
+                "deleted": s["effective"]["deleted"],
+                "version": s["version"],
+            }
+            for s in states
+        ],
+        "fingerprints": fingerprints,
+    }
+
+
+def replay_existing_delivery(
+    conn: sqlite3.Connection, delivery_id: str, observation_ids: list[str]
+) -> Optional[dict]:
+    """已固化的同号切片：集合相同则返回原切片，集合不同则 409；不存在返回 None。"""
+    existing = get_delivery(conn, delivery_id)
+    if existing is None:
+        return None
+    if set(existing["observation_ids"]) != set(observation_ids):
+        raise DeliveryConflict(
+            "交付号已存在且观测号集合不同，不能覆盖已交付内容",
+            delivery_id=existing["delivery_id"],
+            delivered_observation_ids=existing["observation_ids"],
+        )
+    return {**existing, "existing": True}
+
+
+def commit_delivery(conn: sqlite3.Connection, candidate: dict) -> dict:
+    """固化阶段（BEGIN IMMEDIATE 写事务）：一次性发布候选切片。
+
+    写事务跨进程串行化。若组装之后、取到写锁之前有其他进程汇交并改动了
+    任一所选观测，指纹不符则整体放弃（409），绝不发布新旧混合的切片。
+    并发提交同号时，后到者看到已存在的切片即原样返回，只留一份结果。
+    """
+    delivery_id = candidate["delivery_id"]
+    existing = replay_existing_delivery(
+        conn, delivery_id, candidate["observation_ids"]
+    )
+    if existing is not None:  # 并发同号：先到者已固化
+        return existing
+
+    # 组装之后所选观测有任何变化（新修订入库、状态变化）→ 409，不发布混合切片
+    changed = [
+        obs_id
+        for obs_id, fingerprint in candidate["fingerprints"].items()
+        if _fingerprint(conn, obs_id) != fingerprint
+    ]
+    if changed:
+        raise DeliveryConflict(
+            "所选观测在固化前已变化，本次不发布切片，请重新提交交付",
+            delivery_id=delivery_id,
+            changed_observation_ids=sorted(changed),
+        )
+
+    # 兜底：仍须全部可用（不存在/待补齐/冲突一律阻断）
+    blockers: list[dict] = []
+    for obs_id in candidate["observation_ids"]:
+        blocker = _blocker(conn, obs_id)
+        if blocker is not None:
+            blockers.append(blocker)
+    if blockers:
+        raise DeliveryBlocked(blockers)
+
+    conn.execute(
+        "INSERT INTO deliveries (delivery_id, observation_ids) VALUES (?,?)",
+        (delivery_id, json.dumps(candidate["observation_ids"], ensure_ascii=False)),
+    )
+    for position, item in enumerate(candidate["items"]):
+        conn.execute(
+            "INSERT INTO delivery_items (delivery_id, position, observation_id, "
+            "revision_id, tips, species, individual_count, is_delete, obs_version) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                delivery_id,
+                position,
+                item["observation_id"],
+                item["revision_id"],
+                json.dumps(item["tips"], ensure_ascii=False),
+                item["species"],
+                item["count"],
+                1 if item["deleted"] else 0,
+                item["version"],
+            ),
+        )
+    return get_delivery(conn, delivery_id)  # type: ignore[return-value]
+
+
+def _row_to_delivery(row: sqlite3.Row, items: list[dict]) -> dict:
+    return {
+        "delivery_id": row["delivery_id"],
+        "observation_ids": json.loads(row["observation_ids"]),
+        "created_at": row["created_at"],
+        "items": items,
+        "existing": False,
+    }
+
+
+def _item_rows(conn: sqlite3.Connection, delivery_id: str) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM delivery_items WHERE delivery_id = ? ORDER BY position",
+        (delivery_id,),
+    ).fetchall()
+    return [
+        {
+            "observation_id": r["observation_id"],
+            "revision_id": r["revision_id"],
+            "tips": json.loads(r["tips"]),
+            "species": r["species"],
+            "count": r["individual_count"],
+            "deleted": bool(r["is_delete"]),
+            "version": r["obs_version"],
+        }
+        for r in rows
+    ]
+
+
+def get_delivery(conn: sqlite3.Connection, delivery_id: str) -> Optional[dict]:
+    row = conn.execute(
+        "SELECT * FROM deliveries WHERE delivery_id = ?", (delivery_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    return _row_to_delivery(row, _item_rows(conn, delivery_id))
+
+
+def list_deliveries(conn: sqlite3.Connection) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM deliveries ORDER BY created_at, delivery_id"
+    ).fetchall()
+    return [_row_to_delivery(r, _item_rows(conn, r["delivery_id"])) for r in rows]
 
 
 # ---------------------------------------------------------------- 裁决
